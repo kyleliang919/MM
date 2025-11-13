@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
-from ttt_linear import Linear
+from .ttt_linear import Linear
 
 @dataclass
 class GPTConfig:
@@ -173,6 +173,8 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         self.transformer.wte.to(dtype=torch.bfloat16)
+        self.ttt_token = nn.Parameter(torch.randn(1, 1, config.n_embd))
+        self.ttt = False
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -194,6 +196,7 @@ class GPT(nn.Module):
             fan_in = module.weight.size(1)
             std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            torch.nn.init.normal_(module.ttt_weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -232,7 +235,7 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
+        embedding_params = list(self.transformer.wte.parameters()) + [self.ttt_token]
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding and lm_head
@@ -258,7 +261,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_ttt_loss = False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -274,23 +277,29 @@ class GPT(nn.Module):
         x = norm(x)
         norm_x = x
         
-        for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
-        x = norm(x)
+        
         
         if self.training:
-            # taking the output of the last token and start the simulated backward run to compute error
-            ttt_x = x[:,-1:, :].repeat(1, x.shape[1], 1)
+            # compute forward pass and the backward pass at the same time
+            ttt_token = norm(self.ttt_token)
+            ttt_x = ttt_token.repeat(x.shape[0], x.shape[1], 1)
             ttt_x = torch.concat([norm_x, ttt_x], dim = 1)
-
             for block in self.transformer.h:
                 ttt_x = block(ttt_x, cos_sin, None)
             
+            x, _ = torch.chunk(ttt_x, 2, dim = 1)
+            x = norm(x)
+
             # now the final one-step ahead forward pass
             ttt_x = norm_x
             for block in self.transformer.h:
-                ttt_x = block(ttt_x, cos_sin, kv_cache)
+                ttt_x = block(ttt_x, cos_sin, None)
             ttt_x = norm(ttt_x)
+        else:
+            for block in self.transformer.h:
+                x = block(x, cos_sin, kv_cache)
+            x = norm(x)
+                
 
         # Forward the lm_head (compute logits)
         softcap = 15
@@ -306,10 +315,15 @@ class GPT(nn.Module):
                 ttt_logits = self.lm_head(ttt_x)
                 ttt_logits = softcap * torch.tanh(ttt_logits / softcap) # logits softcap
                 ttt_logits = ttt_logits.float() # use tf32/fp32 for logits
-                ttt_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1, reduction=loss_reduction)
-                print("diff logits:", (ttt_logits - logits).mean())
-                print("loss:", loss.mean().item(), "; ttt_loss:", ttt_loss.mean().item())
-                return loss + (ttt_loss - loss.detach())
+                ttt_loss = F.cross_entropy(ttt_logits.reshape(-1, ttt_logits.size(-1)), targets.reshape(-1), ignore_index=-1, reduction=loss_reduction)
+                # return loss
+                # combined_loss = loss + (ttt_loss - loss.detach())
+                # combined_loss = loss
+                combined_loss = torch.exp(ttt_loss - loss) + loss
+                if not return_ttt_loss:
+                    return combined_loss
+                else:
+                    return combined_loss, loss, ttt_loss, (ttt_logits - logits).abs().mean()
             else:
                 return loss
         else:

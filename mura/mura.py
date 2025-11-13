@@ -67,7 +67,7 @@ class LinearFunction(Function):
 
         # Compute gradients:
         # dL/dx = dL/dy @ W
-        grad_x = grad_out.matmul(weight.to(grad_out.dtype))
+        grad_x = grad_out.matmul((weight + (u @ v).t()).to(grad_out.dtype))
 
         # dL/dW = (dL/dy)^T @ x  with batch dims collapsed together.
         # Collapse leading dims (if any) into one big batch for the matmul
@@ -83,6 +83,7 @@ class LinearFunction(Function):
         grad_weight = go2.t().matmul(x2.to(go2.dtype))
         
         # normalize grad weight with newton schulz
+        # ns_grad_weight = grad_weight
         ns_grad_weight = zeropower_via_newtonschulz5(grad_weight, steps = 5).to(v.dtype)
         grad_u = (v @ ns_grad_weight).T
         grad_v = (ns_grad_weight @ u).T
@@ -93,7 +94,6 @@ class LinearFunction(Function):
             # sum over all batch dimensions
             reduce_dims = list(range(grad_out.ndim - 1))
             grad_bias = grad_out.sum(dim=reduce_dims)
-
         return grad_x, grad_weight, grad_u, grad_v, grad_bias
 
 
@@ -101,14 +101,14 @@ class Linear(nn.Module):
     """
     Module wrapper around LinearFunction with explicit params, like nn.Linear.
     """
-    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None, k = 64):
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None, k = 32):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
-        self.u = nn.Parameter(torch.zeros((in_features, k), **factory_kwargs))
-        self.v = nn.Parameter(torch.zeros((k, out_features), **factory_kwargs))
+        self.lora_u = nn.Parameter(torch.zeros((in_features, k), **factory_kwargs))
+        self.lora_v = nn.Parameter(torch.zeros((k, out_features), **factory_kwargs))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
         else:
@@ -118,14 +118,14 @@ class Linear(nn.Module):
     def reset_parameters(self):
         # Same spirit as nn.Linear default init
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.v, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.lora_v, a=math.sqrt(5))
         if self.bias is not None:
             fan_in = self.in_features
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, +bound)
 
     def forward(self, x):
-        return LinearFunction.apply(x, self.weight, self.u, self.v, self.bias)
+        return LinearFunction.apply(x, self.weight, self.lora_u, self.lora_v, self.bias)
 
 
 # --------- Quick correctness check (compare to nn.Linear) ----------

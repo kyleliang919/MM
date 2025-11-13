@@ -19,7 +19,7 @@ from contextlib import nullcontext
 import wandb
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
+from .ttt_gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -31,7 +31,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # User settings
-run = "baseline" # wandb run name default ("dummy" is special - we won't log to wandb)
+run = "ttt-gpt" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
@@ -112,7 +112,7 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
-model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
+# model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -175,6 +175,8 @@ def get_muon_momentum(it):
 # Training loop
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
+smooth_ntp_loss = 0 # EMA of next token prediction loss
+smooth_ttt_loss = 0 # EMA of ttt loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
@@ -266,8 +268,11 @@ for step in range(num_iterations + 1):
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss, ntp_loss, ttt_loss, logits_diff = model(x, y, return_ttt_loss = True)
         train_loss = loss.detach() # for logging
+        ntp_loss = ntp_loss.detach()
+        ttt_loss = ttt_loss.detach()
+        logits_diff = logits_diff.detach().item()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -292,9 +297,13 @@ for step in range(num_iterations + 1):
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_ntp_loss = ema_beta * smooth_ntp_loss + (1 - ema_beta) * ntp_loss.item() # EMA the training loss
+    smooth_ttt_loss = ema_beta * smooth_ttt_loss + (1 - ema_beta) * ttt_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    debiased_ntp_loss = smooth_ntp_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    debiased_ttt_loss = smooth_ttt_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(total_batch_size / dt)
+    tok_per_sec = int(world_tokens_per_fwdbwd / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
@@ -307,6 +316,9 @@ for step in range(num_iterations + 1):
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            "train/ntp_loss": debiased_ntp_loss,
+            "train/ttt_loss": debiased_ttt_loss,
+            "train/logits_diff": logits_diff,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,

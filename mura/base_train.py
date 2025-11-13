@@ -19,8 +19,6 @@ from contextlib import nullcontext
 import wandb
 import torch
 
-# from ttt_gpt import GPT, GPTConfig
-# from nanochat.gpt import GPT, GPTConfig
 from mura_gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -33,7 +31,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # User settings
-run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
+run = "mura" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
@@ -114,7 +112,7 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
-# model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
+model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
