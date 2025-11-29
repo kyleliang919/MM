@@ -10,43 +10,45 @@ class Linear(nn.Module):
 
         # Weight and bias parameters
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        self.ttt_weight = nn.Parameter(torch.empty(out_features, in_features))
+        # self.ttt_weight = nn.Parameter(torch.empty(out_features, in_features))
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
-            self.ttt_bias = nn.Parameter(torch.empty(out_features))
+            # self.ttt_bias = nn.Parameter(torch.empty(out_features))
         else:
             self.register_parameter('bias', None)
-            self.register_parameter('ttt_bias', None)
+            # self.register_parameter('ttt_bias', None)
 
         # Initialize weights
         self.reset_parameters(init)
         self.delta_w = None
+        self.act = None
         self.time_dim = 1
         self.ttt = False
 
     def reset_parameters(self, init):
         if init == "xavier":
             nn.init.xavier_uniform_(self.weight)
-            nn.init.xavier_uniform_(self.ttt_weight)
+            # nn.init.xavier_uniform_(self.ttt_weight)
         elif init == "kaiming":
             nn.init.kaiming_uniform_(self.weight, nonlinearity='linear')
-            nn.init.kaiming_uniform_(self.ttt_weight, nonlinearity='linear')
+            # nn.init.kaiming_uniform_(self.ttt_weight, nonlinearity='linear')
         else:
             nn.init.normal_(self.weight, std=0.02)
-            nn.init.normal_(self.ttt_weight, std=0.02)
+            #nn.init.normal_(self.ttt_weight, std=0.02)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-            nn.init.zeros_(self.ttt_bias)
+            # nn.init.zeros_(self.ttt_bias)
 
     def forward(self, x):
         if self.training:
-            if self.delta_w is None:
-                x, ttt_x = torch.chunk(x, 2, dim =self.time_dim)
+            if self.act is None and self.delta_w is None:
                 out = F.linear(x, self.weight, self.bias)
-                ttt_out = F.linear(x, self.ttt_weight, self.ttt_bias)
-                self.delta_w = ttt_out.reshape(-1, self.out_features).T @ x.reshape(-1, self.in_features)
-                out = torch.concat([out, ttt_out], dim = self.time_dim)
+                self.act = x
+            elif self.delta_w is None:
+                out = F.linear(x, self.weight, self.bias)
+                self.delta_w = out.reshape(-1, self.out_features).T @ self.act.reshape(-1, self.in_features)
+                self.act = None
             else:
                 out = F.linear(x, self.weight + 0.01 * self.delta_w, self.bias)
                 self.delta_w = None

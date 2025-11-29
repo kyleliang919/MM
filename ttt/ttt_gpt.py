@@ -85,9 +85,6 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        if cos.shape[1] != x.shape[1]:
-            cos = torch.concat([cos, cos], dim = 1)
-            sin = torch.concat([sin, sin], dim = 1)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
         q, k = norm(q), norm(k) # QK norm
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
@@ -162,6 +159,7 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.ttt_head = nn.Linear(config.n_embd, config.n_embd, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -173,7 +171,6 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         self.transformer.wte.to(dtype=torch.bfloat16)
-        self.ttt_token = nn.Parameter(torch.randn(1, 1, config.n_embd))
         self.ttt = False
 
     def init_weights(self):
@@ -196,7 +193,7 @@ class GPT(nn.Module):
             fan_in = module.weight.size(1)
             std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            torch.nn.init.normal_(module.ttt_weight, mean=0.0, std=std)
+            # torch.nn.init.normal_(module.ttt_weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -235,8 +232,8 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
-        embedding_params = list(self.transformer.wte.parameters()) + [self.ttt_token]
-        lm_head_params = list(self.lm_head.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters()) + list(self.ttt_head.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
@@ -277,20 +274,19 @@ class GPT(nn.Module):
         x = norm(x)
         norm_x = x
         
-        
-        
         if self.training:
-            # compute forward pass and the backward pass at the same time
-            ttt_token = norm(self.ttt_token)
-            ttt_x = ttt_token.repeat(x.shape[0], x.shape[1], 1)
-            ttt_x = torch.concat([norm_x, ttt_x], dim = 1)
+            # first pass
             for block in self.transformer.h:
-                ttt_x = block(ttt_x, cos_sin, None)
-            
-            x, _ = torch.chunk(ttt_x, 2, dim = 1)
+                x = block(x, cos_sin, None)
             x = norm(x)
 
-            # now the final one-step ahead forward pass
+            # second pass
+            ttt_x = self.ttt_head(x)
+            ttt_x = norm(ttt_x)
+            for block in self.transformer.h:
+                ttt_x = block(ttt_x, cos_sin, None)
+
+            # third pass
             ttt_x = norm_x
             for block in self.transformer.h:
                 ttt_x = block(ttt_x, cos_sin, None)
