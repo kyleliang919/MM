@@ -14,12 +14,13 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
+import copy
 from contextlib import nullcontext
 
 import wandb
 import torch
 
-from mura_gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -27,11 +28,14 @@ from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
+from mm.minmin_optimizer import MinMinOptimizer, minmin_training_step
+from mm.minmin_utils import MinMinBatchSampler
+from mm.minmin_validation import validate_minmin_step, format_minmin_metrics, should_validate_minmin, evaluate_minmin_validation
 print_banner()
 
 # -----------------------------------------------------------------------------
 # User settings
-run = "mura" # wandb run name default ("dummy" is special - we won't log to wandb)
+run = "min_min" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
@@ -52,6 +56,13 @@ grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
+# Min-Min algorithm settings
+minmin_mode = True # "off" or "on" to enable Min-Min two-stage minimization
+minmin_inner_step_size = 0.1 # rho: perturbation magnitude for inner step
+minmin_outer_lr = 0.01 # eta: learning rate for outer step
+minmin_small_batch_size = 32 # b_s: batch size for inner minimization
+minmin_large_batch_size = 256 # b_l: batch size for outer minimization
+minmin_validate_every = 250 # run Min-Min validation metrics every N steps (-1 = disable)
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
@@ -64,6 +75,7 @@ model_tag = "" # optionally override the model tag for the output checkpoint dir
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
+minmin_enabled = (minmin_mode == "on") if isinstance(minmin_mode, str) else bool(minmin_mode)
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -112,7 +124,11 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
-model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
+pert_model = None
+if not minmin_enabled:
+    model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
+else:
+    pert_model = copy.deepcopy(orig_model)
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -142,6 +158,30 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
 optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
 adamw_optimizer, muon_optimizer = optimizers
+
+# Setup Min-Min optimizer if enabled
+minmin_optimizer = None
+batch_sampler = None
+minmin_small_accum_steps = None
+minmin_large_accum_steps = None
+if minmin_enabled:
+    # Create a simple base optimizer for Min-Min (we'll use SGD)
+    minmin_base_opt = torch.optim.SGD(orig_model.parameters(), lr=minmin_outer_lr)
+    minmin_optimizer = MinMinOptimizer(
+        model=orig_model,
+        base_optimizer=minmin_base_opt,
+        inner_step_size=minmin_inner_step_size,
+        outer_lr=minmin_outer_lr,
+        small_batch_size=minmin_small_batch_size,
+        large_batch_size=minmin_large_batch_size,
+    )
+    assert minmin_small_batch_size % device_batch_size == 0
+    assert minmin_large_batch_size % device_batch_size == 0
+    minmin_small_accum_steps = minmin_small_batch_size // device_batch_size
+    minmin_large_accum_steps = minmin_large_batch_size // device_batch_size
+    print0(f"Min-Min enabled: ρ={minmin_inner_step_size}, η={minmin_outer_lr}, b_s={minmin_small_batch_size}, b_ℓ={minmin_large_batch_size}")
+else:
+    print0("Min-Min disabled")
 
 # Initialize the DataLoaders for train/val
 base_dir = get_base_dir()
@@ -198,6 +238,30 @@ for step in range(num_iterations + 1):
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
+
+        if minmin_enabled and minmin_small_accum_steps is not None:
+            val_loader_minmin = build_val_loader()
+            minmin_val = evaluate_minmin_validation(
+                model=orig_model,
+                val_loader=val_loader_minmin,
+                small_accum_steps=minmin_small_accum_steps,
+                large_accum_steps=minmin_large_accum_steps,
+                inner_step_size=minmin_inner_step_size,
+                autocast_ctx=autocast_ctx,
+            )
+            print0(
+                f"Step {step:05d} | Min-Min val small loss: {minmin_val['small_loss']:.6f} "
+                f"| Min-Min val large loss: {minmin_val['large_loss']:.6f} "
+                f"| Min-Min val large loss (orig): {minmin_val['large_loss_orig']:.6f} "
+                f"| Min-Min val delta: {minmin_val['large_loss_delta']:.6f}"
+            )
+            wandb_run.log({
+                "step": step,
+                "minmin/val_small_loss": minmin_val["small_loss"],
+                "minmin/val_large_loss": minmin_val["large_loss"],
+                "minmin/val_large_loss_orig": minmin_val["large_loss_orig"],
+                "minmin/val_large_loss_delta": minmin_val["large_loss_delta"],
+            })
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -261,33 +325,139 @@ for step in range(num_iterations + 1):
 
     # -------------------------------------------------------------------------
     # single training step
-    # evaluate the gradient
-    synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # gradient clipping (TODO possibly experiment with)
-    if grad_clip > 0.0:
-        torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
-    # step the optimizers
-    lrm = get_lr_multiplier(step)
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-    muon_momentum = get_muon_momentum(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-    synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+    
+    if minmin_enabled:
+        # ===== Min-Min Two-Stage Minimization =====
+        synchronize()
+        t0 = time.time()
+        
+        # Collect gradient accumulation steps for small batch
+        small_loss = torch.tensor(0.0, device=device)
+        for micro_step in range(minmin_small_accum_steps):
+            with autocast_ctx:
+                loss = model(x, y)
+            small_loss = small_loss + loss
+            x, y = next(train_loader)
+        small_loss = small_loss / minmin_small_accum_steps
+        train_loss = small_loss.detach()
+        
+        # Inner step: perturbation using normalized small-batch gradient
+        adamw_optimizer.zero_grad()
+        muon_optimizer.zero_grad()
+        small_loss.backward()
+        
+        # Save original parameters and gradients for validation
+        orig_params = [p.data.clone() for p in orig_model.parameters()]
+        small_grad = [p.grad.clone() if p.grad is not None else None for p in orig_model.parameters()]
+        
+        # Normalize and perturb: δ = -ρ * g_s / ||g_s||_2 (per-parameter)
+        for p_pert, p_orig in zip(pert_model.parameters(), orig_model.parameters()):
+            p_pert.data.copy_(p_orig.data)
+            if p_orig.grad is not None:
+                g_norm = torch.norm(p_orig.grad, p=2)
+                if g_norm > 1e-8:
+                    normalized_grad = p_orig.grad / g_norm
+                    p_pert.data = p_pert.data - minmin_inner_step_size * normalized_grad
+        
+        # Save perturbed parameters for validation
+        pert_params = [p.data.clone() for p in pert_model.parameters()]
+        
+        # Collect gradient accumulation steps for large batch at perturbed point
+        pert_model.zero_grad(set_to_none=True)
+        large_loss_sum = torch.tensor(0.0, device=device)
+        for micro_step in range(minmin_large_accum_steps):
+            with autocast_ctx:
+                loss = pert_model(x, y)
+            large_loss_sum = large_loss_sum + loss.detach()
+            (loss / minmin_large_accum_steps).backward()
+            x, y = next(train_loader)
+        large_loss = large_loss_sum / minmin_large_accum_steps
+
+        # Save large-batch gradient for validation
+        large_grad = [p.grad.clone() if p.grad is not None else None for p in pert_model.parameters()]
+        for p, g in zip(orig_model.parameters(), large_grad):
+            if g is None:
+                p.grad = None
+            else:
+                p.grad = g.clone()
+
+        # Gradient clipping
+        if grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        
+        # Step with learning rate schedule
+        lrm = get_lr_multiplier(step)
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
+        muon_momentum = get_muon_momentum(step)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
+        for opt in optimizers:
+            opt.step()
+        
+        model.zero_grad(set_to_none=True)
+        synchronize()
+        t1 = time.time()
+        dt = t1 - t0
+        
+        # ===== Min-Min Validation =====
+        if minmin_validate_every > 0 and should_validate_minmin(step, minmin_validate_every):
+            minmin_metrics = validate_minmin_step(
+                model=orig_model,
+                original_params=orig_params,
+                perturbed_params=pert_params,
+                small_grad=small_grad,
+                large_grad=large_grad,
+                small_loss=train_loss.item(),
+                large_loss=large_loss.item(),
+                small_batch_size=minmin_small_batch_size,
+                large_batch_size=minmin_large_batch_size,
+                inner_step_size=minmin_inner_step_size,
+            )
+            
+            if master_process:
+                print0(f"Step {step:05d} | {format_minmin_metrics(minmin_metrics)}")
+            
+            wandb_run.log({
+                "step": step,
+                "minmin/grad_alignment": minmin_metrics['grad_alignment'],
+                "minmin/grad_norm_ratio": minmin_metrics['grad_norm_ratio'],
+                "minmin/perturbation_magnitude": minmin_metrics['perturbation_magnitude'],
+                "minmin/small_batch_loss": minmin_metrics['small_batch_loss'],
+                "minmin/large_batch_loss": minmin_metrics['large_batch_loss'],
+                "minmin/small_grad_norm": minmin_metrics['small_grad_norm'],
+                "minmin/large_grad_norm": minmin_metrics['large_grad_norm'],
+            })
+    else:
+        # ===== Standard Training Step (Original) =====
+        # evaluate the gradient
+        synchronize()
+        t0 = time.time()
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                loss = model(x, y)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            loss.backward()
+            x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # gradient clipping (TODO possibly experiment with)
+        if grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        # step the optimizers
+        lrm = get_lr_multiplier(step)
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
+        muon_momentum = get_muon_momentum(step)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+        synchronize()
+        t1 = time.time()
+        dt = t1 - t0
     # -------------------------------------------------------------------------
 
     # logging
@@ -332,6 +502,11 @@ get_report().log(section="Base model training", data=[
         "warmup_ratio": warmup_ratio,
         "warmdown_ratio": warmdown_ratio,
         "final_lr_frac": final_lr_frac,
+        "Min-Min mode": minmin_enabled,
+        "Min-Min rho (ρ)": minmin_inner_step_size if minmin_enabled else None,
+        "Min-Min eta (η)": minmin_outer_lr if minmin_enabled else None,
+        "Min-Min small batch (b_s)": minmin_small_batch_size if minmin_enabled else None,
+        "Min-Min large batch (b_ℓ)": minmin_large_batch_size if minmin_enabled else None,
     },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,

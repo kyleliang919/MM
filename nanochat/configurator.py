@@ -53,4 +53,10 @@ for arg in sys.argv[1:]:
             print0(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt
         else:
-            raise ValueError(f"Unknown config key: {key}")
+            # Allow new keys to be added (for backwards compatibility and flexibility)
+            try:
+                attempt = literal_eval(val)
+            except (SyntaxError, ValueError):
+                attempt = val
+            print0(f"Adding new config key: {key} = {attempt}")
+            globals()[key] = attempt
